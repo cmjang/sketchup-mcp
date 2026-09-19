@@ -76,6 +76,14 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 * `export_scene` - Export the scene to `skp`, `obj`, `dae`, `stl`, `png` or `jpg`. `filepath` sets an absolute destination (parent folders created); without it a timestamped file goes to the system temp directory and the response reports its `path`. Image exports accept `width`/`height`. `skp` exports use `save_copy` so the working model's path stays bound where it was (models never saved before fall back to `save`)
 * `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations (saving, layers, scenes, import, follow-me, shadows, ... — see the tool description for recipes). Each evaluation runs inside an undoable operation; if the code raises, the changes are rolled back
 
+#### Asset layer (free CC0 sources, no API keys required unless noted)
+
+* `search_textures` / `apply_texture` - Search [ambientCG](https://ambientcg.com) or [Poly Haven](https://polyhaven.com) CC0 textures and apply them to an entity as a textured material (`repeat` sets the tile size in inches). Downloads are cached in `~/.sketchup_mcp_assets`
+* `get_asset_preview` - Fetch a texture thumbnail as an image to see it before applying
+* `search_sketchfab` - Public Sketchfab model search; downloads need a Sketchfab account, then `import_glb` accepts any glb URL
+* `search_polypizza` - Free low-poly models from [Poly Pizza](https://poly.pizza); set `POLYPIZZA_API_KEY` (free) in the MCP server environment
+* `import_glb` / `import_file` - Import from URL or local disk: **SketchUp 2025+ imports GLB natively with embedded textures**; also obj/dae/stl/3ds, dwg/dxf (Pro), ifc, kmz, images, and `.skp` files (use for 3D Warehouse downloads and local component libraries)
+
 #### Known limitations
 
 * `chamfer_edges`/`fillet_edges` were removed: their handlers predated the current bridge and called long-removed APIs (`Entity#copy`), so they never worked. SketchUp has no native edge-rounding API; use `eval_ruby` or an extension like RoundCorner for that

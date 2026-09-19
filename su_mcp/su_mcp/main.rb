@@ -264,6 +264,10 @@ module SU_MCP
           get_viewport_screenshot(args)
         when "get_addon_status"
           get_addon_status(args)
+        when "set_texture"
+          set_texture(args)
+        when "import_file"
+          import_file(args)
         when "export", "export_scene"
           export_scene(args)
         when "set_material"
@@ -708,6 +712,49 @@ module SU_MCP
         uptime_seconds: @start_time ? (Time.now - @start_time).round : nil
       }
       { success: true, result: JSON.generate(status) }
+    end
+
+    # Apply an image file as a texture-mapped material on an entity.
+    # size is the repeat length in inches (SketchUp texture tiling).
+    def set_texture(params)
+      model = Sketchup.active_model
+      texture_path = params["texture_path"].to_s
+      raise "texture_path required" if texture_path.empty?
+      raise "Texture file not found: #{texture_path}" unless File.exist?(texture_path)
+
+      entity = model.find_entity_by_id(params["id"].to_s.gsub('"', '').to_i)
+      raise "Entity not found" unless entity
+
+      material_name = params["material_name"] || File.basename(texture_path, ".*")
+      material = model.materials[material_name] || model.materials.add(material_name)
+      material.texture = texture_path
+      material.texture.size = params["size"].to_f if params["size"] && params["size"].to_f > 0
+
+      entities = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+      faces = entities.grep(Sketchup::Face)
+      raise "Entity has no faces to texture" if faces.empty?
+      faces.each { |face| face.material = material }
+
+      { success: true, id: entity.entityID, material: material_name,
+        textured_faces: faces.size }
+    end
+
+    # Import any file SketchUp supports (glb/gltb, obj, dae, stl, 3ds, dwg,
+    # dxf, ifc, kmz, images, ...). GLB imports keep embedded textures.
+    def import_file(params)
+      model = Sketchup.active_model
+      filepath = params["filepath"].to_s
+      raise "filepath required" if filepath.empty?
+      raise "File not found: #{filepath}" unless File.exist?(filepath)
+
+      before = model.entities.map(&:entityID)
+      imported = model.import(filepath, false)
+      raise "SketchUp importer rejected the file" unless imported
+      new_entities = model.entities.to_a.select { |e| !before.include?(e.entityID) }
+
+      { success: true, path: filepath,
+        count: new_entities.size,
+        ids: new_entities.map(&:entityID) }
     end
 
     # Write a PNG of the current viewport to a caller-provided path. The

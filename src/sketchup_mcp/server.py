@@ -4,7 +4,11 @@ import json
 import asyncio
 import logging
 import os
+import re
 import tempfile
+import urllib.request
+import urllib.parse
+import zipfile
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
@@ -15,7 +19,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.21"
+__version__ = "0.2.0"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -769,6 +773,243 @@ def eval_ruby(
             "success": False,
             "error": str(e)
         })
+
+
+# ---------------------------------------------------------------------------
+# Asset layer: free CC0 texture/model sources with public APIs, plus generic
+# file import. SketchUp 2025+ imports GLB natively (geometry, materials and
+# embedded textures), so no converter is needed.
+# ---------------------------------------------------------------------------
+
+ASSET_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".sketchup_mcp_assets")
+
+def _http_get_bytes(url: str, headers: dict = None, timeout: float = 60.0) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "sketchup-mcp/asset-layer", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+def _http_get_json(url: str, headers: dict = None):
+    return json.loads(_http_get_bytes(url, headers).decode("utf-8"))
+
+def _cache_path(*parts) -> str:
+    path = os.path.join(ASSET_CACHE_DIR, *parts)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+def _ambientcg_search(query: str, limit: int = 10):
+    url = "https://ambientcg.com/api/v2/full_json?" + urllib.parse.urlencode(
+        {"q": query, "type": "Material", "limit": limit})
+    data = _http_get_json(url)
+    return [
+        {"id": a["assetId"], "name": a.get("displayName") or a["assetId"],
+         "preview": (a.get("previewImage") or {}).get("256-PNG"), "source": "ambientcg"}
+        for a in data.get("foundAssets", [])
+    ]
+
+def _polyhaven_search(query: str, limit: int = 10):
+    url = f"https://api.polyhaven.com/assets?t=textures&q={urllib.parse.quote(query)}"
+    data = _http_get_json(url, headers={"Referer": "sketchup-mcp"})
+    # The API's q parameter only matches some fields; refine client-side by
+    # name/category/tag substring so results are actually relevant.
+    q = query.lower()
+    def _words(value):
+        if isinstance(value, dict):
+            return " ".join(value.keys())
+        if isinstance(value, list):
+            return " ".join(str(v) for v in value)
+        return str(value or "")
+    def matches(asset_id, a):
+        haystack = " ".join([asset_id, a.get("name") or "",
+                             _words(a.get("categories")),
+                             _words(a.get("tags"))]).lower()
+        return all(word in haystack for word in q.split())
+    filtered = {k: v for k, v in data.items() if matches(k, v)} or data
+    results = []
+    for asset_id, a in list(filtered.items())[:limit]:
+        results.append({
+            "id": asset_id, "name": a.get("name") or asset_id,
+            "preview": f"https://cdn.polyhaven.com/asset_img/thumbs/{asset_id}.png?width=256",
+            "source": "polyhaven"})
+    return results
+
+def _ambientcg_texture_file(asset_id: str) -> str:
+    """Download the ambientCG zip for the asset and return the diffuse JPG path."""
+    cached = None
+    for res in ("2K-JPG", "1K-JPG"):
+        zip_path = _cache_path(f"{asset_id}_{res}.zip")
+        if not os.path.exists(zip_path):
+            try:
+                data = _http_get_bytes(f"https://ambientcg.com/get?file={asset_id}_{res}.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(data)
+            except Exception:
+                continue
+        out_dir = _cache_path(asset_id)
+        os.makedirs(out_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(out_dir)
+        for name in sorted(os.listdir(out_dir)):
+            if re.search(r"_(Color|Diffuse|Col)\.jpg$", name, re.IGNORECASE):
+                cached = os.path.join(out_dir, name)
+                break
+        if cached:
+            return cached
+    raise Exception(f"Could not fetch a diffuse texture for {asset_id}")
+
+def _polyhaven_texture_file(asset_id: str) -> str:
+    """Resolve the diffuse JPG from Poly Haven (smallest size >= 1k)."""
+    files = _http_get_json(f"https://api.polyhaven.com/files/{asset_id}",
+                           headers={"Referer": "sketchup-mcp"})
+    diffuse = files.get("Diffuse") or {}
+    for size in ("1k", "2k", "4k"):
+        entry = diffuse.get(size, {}).get("jpg")
+        if entry:
+            dest = _cache_path(f"{asset_id}_diffuse_{size}.jpg")
+            if not os.path.exists(dest):
+                data = _http_get_bytes(entry["url"], headers={"Referer": "sketchup-mcp"})
+                with open(dest, "wb") as f:
+                    f.write(data)
+            return dest
+    raise Exception(f"No diffuse JPG found for Poly Haven asset {asset_id}")
+
+def _download_to_cache(url: str, filename: str) -> str:
+    dest = _cache_path(filename)
+    if not os.path.exists(dest):
+        data = _http_get_bytes(url)
+        with open(dest, "wb") as f:
+            f.write(data)
+    return dest
+
+@mcp.tool()
+def search_textures(ctx: Context, query: str, source: str = "ambientcg") -> str:
+    """Search free CC0 texture libraries: 'ambientcg' (default) or 'polyhaven'.
+    Returns asset ids/names; preview thumbnails via get_asset_preview."""
+    try:
+        if source == "ambientcg":
+            results = _ambientcg_search(query)
+        elif source == "polyhaven":
+            results = _polyhaven_search(query)
+        else:
+            return f"Unknown source '{source}' (use ambientcg or polyhaven)"
+        return json.dumps({"success": True, "source": source, "count": len(results), "results": results})
+    except Exception as e:
+        return f"Error searching textures: {str(e)}"
+
+@mcp.tool()
+def get_asset_preview(ctx: Context, asset_id: str, source: str = "ambientcg") -> Image:
+    """Fetch the preview thumbnail of a texture asset as an image."""
+    if source == "ambientcg":
+        results = _ambientcg_search(asset_id, limit=1)
+        url = results[0]["preview"] if results else None
+    else:
+        url = f"https://cdn.polyhaven.com/asset_img/thumbs/{asset_id}.png?width=256"
+    if not url:
+        raise Exception(f"No preview found for {asset_id}")
+    return Image(data=_http_get_bytes(url), format="png")
+
+@mcp.tool()
+def apply_texture(
+    ctx: Context,
+    id: str,
+    asset_id: str,
+    source: str = "ambientcg",
+    repeat: float = None
+) -> str:
+    """Download a CC0 texture (ambientcg/polyhaven) and apply it to an
+    entity's faces as a textured material. repeat: texture tile size in
+    SketchUp inches."""
+    try:
+        if source == "ambientcg":
+            texture_path = _ambientcg_texture_file(asset_id)
+        elif source == "polyhaven":
+            texture_path = _polyhaven_texture_file(asset_id)
+        else:
+            return f"Unknown source '{source}' (use ambientcg or polyhaven)"
+
+        sketchup = get_sketchup_connection()
+        arguments = {"id": id, "texture_path": texture_path, "material_name": asset_id}
+        if repeat:
+            arguments["size"] = repeat
+        result = sketchup.send_command(
+            method="tools/call",
+            params={"name": "set_texture", "arguments": arguments},
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error applying texture: {str(e)}"
+
+@mcp.tool()
+def search_sketchfab(ctx: Context, query: str, count: int = 8) -> str:
+    """Search Sketchfab models (public search, no account needed). Returns
+    names and uids with a downloadability hint; downloading requires a
+    Sketchfab account/token - use import_glb with any glb URL you obtain."""
+    try:
+        url = f"https://api.sketchfab.com/v3/search?type=models&q={urllib.parse.quote(query)}&count={count}"
+        data = _http_get_json(url)
+        results = [
+            {"uid": r.get("uid"), "name": r.get("name"),
+             "downloadable": r.get("isDownloadable"),
+             "url": f"https://sketchfab.com/3d-models/{r.get('uid')}"}
+            for r in data.get("results", [])
+        ]
+        return json.dumps({"success": True, "count": len(results), "results": results})
+    except Exception as e:
+        return f"Error searching Sketchfab: {str(e)}"
+
+@mcp.tool()
+def search_polypizza(ctx: Context, query: str) -> str:
+    """Search Poly Pizza's free low-poly model library. Requires the
+    POLYPIZZA_API_KEY environment variable (free key from poly.pizza);
+    download the returned glb URLs with import_glb."""
+    api_key = os.environ.get("POLYPIZZA_API_KEY")
+    if not api_key:
+        return ("POLYPIZZA_API_KEY is not set. Get a free key at https://poly.pizza/"
+                "api/ and pass it via the MCP server environment.")
+    try:
+        url = f"https://api.poly.pizza/v1/search?q={urllib.parse.quote(query)}"
+        data = _http_get_json(url, headers={"X-API-Key": api_key})
+        results = [
+            {"name": r.get("name"), "glb": (r.get("download") or {}).get("glb"),
+             "license": r.get("license")}
+            for r in data.get("models", [])
+        ]
+        return json.dumps({"success": True, "count": len(results), "results": results})
+    except Exception as e:
+        return f"Error searching Poly Pizza: {str(e)}"
+
+@mcp.tool()
+def import_glb(ctx: Context, url: str) -> str:
+    """Download a glb/gltf/obj/dae/stl file from a URL and import it into
+    SketchUp. SketchUp 2025+ imports GLB natively with embedded textures."""
+    try:
+        filename = os.path.basename(urllib.parse.urlparse(url).path) or "asset.glb"
+        filepath = _download_to_cache(url, filename)
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call",
+            params={"name": "import_file", "arguments": {"filepath": filepath}},
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error importing model: {str(e)}"
+
+@mcp.tool()
+def import_file(ctx: Context, filepath: str) -> str:
+    """Import a local file into SketchUp (skp component, glb/gltf, obj, dae,
+    stl, 3ds, dwg/dxf Pro, ifc, kmz, images). Use for 3D Warehouse .skp
+    downloads and local component libraries."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call",
+            params={"name": "import_file", "arguments": {"filepath": filepath}},
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error importing file: {str(e)}"
 
 def main():
     mcp.run()

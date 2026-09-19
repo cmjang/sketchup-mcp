@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.18"
+__version__ = "0.1.19"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -359,6 +359,99 @@ def get_selection(ctx: Context) -> str:
         return f"Error getting selection: {str(e)}"
 
 @mcp.tool()
+def get_model_info(ctx: Context, id: str = None) -> str:
+    """Inspect the Sketchup model. Without id: global summary (entity counts by
+    type, model bounds, scenes, layers, materials, units, selection). With an
+    entity id: details for that entity (bounds, layer, definition, volume,
+    surface area, face/edge counts). Read-only."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {}
+        if id is not None:
+            arguments["id"] = id
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "get_model_info",
+                "arguments": arguments
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error getting model info: {str(e)}"
+
+@mcp.tool()
+def set_camera(
+    ctx: Context,
+    standard_view: str = None,
+    eye: List[float] = None,
+    target: List[float] = None,
+    up: List[float] = None,
+    fov: float = None,
+    perspective: bool = True,
+    zoom_extents: bool = False
+) -> str:
+    """Position the camera. standard_view: top/bottom/front/back/left/right/iso
+    (centered on the model). Or pass explicit eye/target (required together) and
+    optional up vector, in SketchUp inches. fov in degrees; perspective=False
+    gives an orthographic view; zoom_extents=True fits the model after moving.
+    Pair with export_scene(format='png') to capture from the new viewpoint."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {"perspective": perspective, "zoom_extents": zoom_extents}
+        if standard_view is not None:
+            arguments["standard_view"] = standard_view
+        if eye is not None and target is not None:
+            arguments["eye"] = eye
+            arguments["target"] = target
+            if up is not None:
+                arguments["up"] = up
+        if fov is not None:
+            arguments["fov"] = fov
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "set_camera",
+                "arguments": arguments
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error setting camera: {str(e)}"
+
+@mcp.tool()
+def boolean_operation(
+    ctx: Context,
+    operation: str,
+    target_id: str,
+    tool_id: str,
+    delete_originals: bool = False
+) -> str:
+    """Boolean operation between two groups/components: 'union', 'difference'
+    (target minus tool) or 'intersection'. Distances/sizes are in SketchUp
+    inches. Returns the result group's resourceId."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "boolean_operation",
+                "arguments": {
+                    "operation": operation,
+                    "target_id": target_id,
+                    "tool_id": tool_id,
+                    "delete_originals": delete_originals
+                }
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error in boolean operation: {str(e)}"
+
+@mcp.tool()
 def set_material(
     ctx: Context,
     id: str,
@@ -553,7 +646,19 @@ def eval_ruby(
     ctx: Context,
     code: str
 ) -> str:
-    """Evaluate arbitrary Ruby code in Sketchup"""
+    """Evaluate arbitrary Ruby code in Sketchup — use this for anything without
+    a dedicated tool. Common recipes (m = Sketchup.active_model):
+    - save: m.save('/path/model.skp') | non-destructive copy: m.save_copy('/path/copy.skp')
+    - undo/redo: m.undo | m.redo
+    - tag/layer: l = m.layers.add('Walls'); m.active_layer = l; entity.layer = l
+    - scene/page: m.pages.add('Scene 1'); m.pages.selected_page = m.pages['Scene 1']
+    - import file: m.import('/path/file.dwg') (supports dwg/dxf/ifc/kmz/3ds/stl/images)
+    - follow-me (loft): face.followme(path_edges)
+    - offset face: face.offset(2.0) # inches
+    - shadows: s = m.shadow_info; s['ShadowDate']='2026/06/21'; s['ShadowTime']='14:00:00'
+    - display toggles: m.rendering_options['DisplayShadows'] = true
+    - arc/curve/ngon/text: entities.add_arc / add_curve / add_ngon / add_3d_text
+    Runs inside one undoable operation; if the code raises, changes roll back."""
     try:
         logger.info(f"eval_ruby called with code length: {len(code)}")
         

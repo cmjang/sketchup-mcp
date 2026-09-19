@@ -255,6 +255,10 @@ module SU_MCP
           transform_component(args)
         when "get_selection"
           get_selection
+        when "get_model_info"
+          get_model_info(args)
+        when "set_camera"
+          set_camera(args)
         when "export", "export_scene"
           export_scene(args)
         when "set_material"
@@ -544,6 +548,148 @@ module SU_MCP
       
       { success: true, entities: selected_entities }
     end
+
+    LENGTH_UNIT_NAMES = {
+      1 => "inches", 2 => "feet", 3 => "millimeters",
+      4 => "centimeters", 5 => "meters"
+    }.freeze
+
+    # Read-only model inspection. Without an id: global summary (entity counts,
+    # bounds, scenes, layers, materials, units, selection). With an id:
+    # details for one entity (bounds, layer, volume, surface area, ...).
+    # Lengths go through Sketchup.format_length so they respect model units.
+    def get_model_info(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      if params && params["id"]
+        id = params["id"].to_s.gsub('"', '').to_i
+        entity = model.find_entity_by_id(id)
+        raise "Entity not found: #{params['id']}" unless entity
+
+        info = { id: entity.entityID, type: entity.typename }
+        info[:name] = entity.name if entity.respond_to?(:name) && !entity.name.to_s.empty?
+        info[:layer] = entity.layer.name if entity.respond_to?(:layer)
+        info[:hidden] = entity.hidden? if entity.respond_to?(:hidden?)
+        info[:locked] = entity.locked? if entity.respond_to?(:locked?)
+        info[:material] = entity.material.name if entity.respond_to?(:material) && entity.material
+
+        if entity.respond_to?(:bounds) && !entity.bounds.empty?
+          bb = entity.bounds
+          info[:bounds_min] = bb.min.to_a.map { |v| Sketchup.format_length(v) }
+          info[:bounds_max] = bb.max.to_a.map { |v| Sketchup.format_length(v) }
+          info[:bounds_size] = [bb.width, bb.depth, bb.height].map { |v| Sketchup.format_length(v) }
+        end
+
+        if entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
+          ents = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+          info[:definition] = entity.definition.name if entity.is_a?(Sketchup::ComponentInstance)
+          faces = ents.grep(Sketchup::Face)
+          info[:faces] = faces.size
+          info[:edges] = ents.grep(Sketchup::Edge).size
+          info[:surface_area] = Sketchup.format_area(faces.sum(&:area))
+          begin
+            info[:volume] = Sketchup.format_volume(entity.volume) if entity.volume > 0
+          rescue
+            # volume raises on non-solids; just omit it
+          end
+        elsif entity.is_a?(Sketchup::Face)
+          info[:area] = Sketchup.format_area(entity.area)
+        end
+
+        return { success: true, result: JSON.pretty_generate(info) }
+      end
+
+      counts = Hash.new(0)
+      model.entities.each { |e| counts[e.typename] += 1 }
+
+      info = {
+        title: model.title,
+        path: model.path,
+        modified: model.modified?,
+        total_entities: model.entities.count,
+        entities_by_type: counts,
+        faces: model.number_faces
+      }
+
+      unless model.bounds.empty?
+        bb = model.bounds
+        info[:model_bounds_min] = bb.min.to_a.map { |v| Sketchup.format_length(v) }
+        info[:model_bounds_max] = bb.max.to_a.map { |v| Sketchup.format_length(v) }
+        info[:model_size] = [bb.width, bb.depth, bb.height].map { |v| Sketchup.format_length(v) }
+      end
+
+      info[:scenes] = model.pages.map(&:name)
+      info[:active_scene] = model.pages.selected_page ? model.pages.selected_page.name : nil
+      info[:layers] = model.layers.map(&:name)
+      info[:active_layer] = model.active_layer.name
+      info[:materials] = model.materials.map(&:name)
+      units = model.options["UnitsOptions"]
+      info[:units] = {
+        length: LENGTH_UNIT_NAMES[units["LengthUnit"]] || units["LengthUnit"],
+        precision: units["LengthPrecision"],
+        format: units["LengthFormat"]
+      }
+      selection = model.selection
+      info[:selection_count] = selection.size
+      info[:selection] = selection.to_a.first(20).map do |e|
+        entry = { id: e.entityID, type: e.typename }
+        entry[:name] = e.name if e.respond_to?(:name) && !e.name.to_s.empty?
+        entry
+      end
+
+      { success: true, result: JSON.pretty_generate(info) }
+    end
+
+    # Position the camera by standard view name, or explicit eye/target/up.
+    # All points are in SketchUp internal inches.
+    def set_camera(params)
+      model = Sketchup.active_model
+      view = model.active_view
+      bb = model.bounds
+      center = bb.empty? ? ORIGIN : bb.center
+      perspective = params.fetch("perspective", true)
+
+      if params["eye"] && params["target"]
+        view_name = "custom"
+        eye = Geom::Point3d.new(params["eye"].map(&:to_f))
+        target = Geom::Point3d.new(params["target"].map(&:to_f))
+        up = params["up"] ? Geom::Vector3d.new(params["up"].map(&:to_f)) : Z_AXIS
+      elsif params["standard_view"]
+        view_name = params["standard_view"].to_s.downcase
+        directions = {
+          "top"    => [[0, 0, 1],  [0, 1, 0]],
+          "bottom" => [[0, 0, -1], [0, 1, 0]],
+          "front"  => [[0, -1, 0], [0, 0, 1]],
+          "back"   => [[0, 1, 0],  [0, 0, 1]],
+          "right"  => [[1, 0, 0],  [0, 0, 1]],
+          "left"   => [[-1, 0, 0], [0, 0, 1]],
+          "iso"    => [[1, -1, 1], [0, 0, 1]]
+        }
+        dir_up = directions[view_name]
+        raise "Unknown standard_view '#{view_name}' (use top/bottom/front/back/left/right/iso)" unless dir_up
+        dir = Geom::Vector3d.new(dir_up[0]).normalize
+        dist = bb.empty? ? 100.0 : bb.diagonal * 1.2
+        eye = center.offset(dir, dist)
+        target = center
+        up = Geom::Vector3d.new(dir_up[1])
+      else
+        raise "Provide either standard_view or eye + target"
+      end
+
+      camera = Sketchup::Camera.new(eye, target, up, perspective)
+      camera.fov = params["fov"].to_f if params["fov"]
+      view.camera = camera
+      view.zoom_extents if params["zoom_extents"]
+
+      {
+        success: true,
+        view: view_name,
+        eye: eye.to_a.map { |v| v.round(4) },
+        target: target.to_a.map { |v| v.round(4) },
+        perspective: perspective
+      }
+    end
     
     def export_scene(params)
       log "Exporting scene with params: #{params.inspect}"
@@ -730,188 +876,77 @@ module SU_MCP
       end
     end
     
+    # Copy an entity's geometry into a fresh solid Group at the same world
+    # position. Group#entities.parent exposes the group's hidden definition,
+    # so the same add_instance path works for groups and component instances.
+    # The nested instance is exploded so the wrapper is a manifold solid,
+    # which the native boolean methods require.
+    def to_solid_group(entity)
+      model = Sketchup.active_model
+      wrapper = model.active_entities.add_group
+      definition = entity.is_a?(Sketchup::Group) ? entity.entities.parent : entity.definition
+      instance = wrapper.entities.add_instance(definition, entity.transformation)
+      instance.explode
+      wrapper
+    end
+
     def boolean_operation(params)
       log "Performing boolean operation with params: #{params.inspect}"
       model = Sketchup.active_model
-      
-      # Get operation type
+
       operation_type = params["operation"]
       unless ["union", "difference", "intersection"].include?(operation_type)
         raise "Invalid boolean operation: #{operation_type}. Must be 'union', 'difference', or 'intersection'."
       end
-      
-      # Get target and tool entities
-      target_id = params["target_id"].to_s.gsub('"', '')
-      tool_id = params["tool_id"].to_s.gsub('"', '')
-      
-      log "Looking for target entity with ID: #{target_id}"
-      target_entity = model.find_entity_by_id(target_id.to_i)
-      
-      log "Looking for tool entity with ID: #{tool_id}"
-      tool_entity = model.find_entity_by_id(tool_id.to_i)
-      
+
+      target_entity = model.find_entity_by_id(params["target_id"].to_s.gsub('"', '').to_i)
+      tool_entity = model.find_entity_by_id(params["tool_id"].to_s.gsub('"', '').to_i)
       unless target_entity && tool_entity
-        missing = []
-        missing << "target" unless target_entity
-        missing << "tool" unless tool_entity
-        raise "Entity not found: #{missing.join(', ')}"
+        raise "Entity not found: #{target_entity ? 'tool' : 'target'}"
       end
-      
-      # Ensure both entities are groups or component instances
+
       unless (target_entity.is_a?(Sketchup::Group) || target_entity.is_a?(Sketchup::ComponentInstance)) &&
              (tool_entity.is_a?(Sketchup::Group) || tool_entity.is_a?(Sketchup::ComponentInstance))
         raise "Boolean operations require groups or component instances"
       end
-      
-      # Create a new group to hold the result
-      result_group = model.active_entities.add_group
-      
-      # Perform the boolean operation
-      case operation_type
-      when "union"
-        log "Performing union operation"
-        perform_union(target_entity, tool_entity, result_group)
-      when "difference"
-        log "Performing difference operation"
-        perform_difference(target_entity, tool_entity, result_group)
-      when "intersection"
-        log "Performing intersection operation"
-        perform_intersection(target_entity, tool_entity, result_group)
+
+      model.start_operation("MCP boolean #{operation_type}", true)
+      begin
+        target_group = to_solid_group(target_entity)
+        tool_group = to_solid_group(tool_entity)
+
+        if target_group.volume <= 0
+          raise "Target entity is not a solid (volume is zero)"
+        end
+        if tool_group.volume <= 0
+          raise "Tool entity is not a solid (volume is zero)"
+        end
+
+        # Native solid operations consume both operand groups and return a
+        # new group with the result.
+        result_group = case operation_type
+        when "union"
+          target_group.union(tool_group)
+        when "difference"
+          target_group.subtract(tool_group)
+        when "intersection"
+          target_group.intersect(tool_group)
+        end
+        raise "#{operation_type} failed" unless result_group
+
+        if params["delete_originals"]
+          target_entity.erase! if target_entity.valid?
+          tool_entity.erase! if tool_entity.valid?
+        end
+
+        model.commit_operation
+        { success: true, id: result_group.entityID }
+      rescue Exception
+        model.abort_operation
+        raise
       end
-      
-      # Clean up original entities if requested
-      if params["delete_originals"]
-        target_entity.erase! if target_entity.valid?
-        tool_entity.erase! if tool_entity.valid?
-      end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: result_group.entityID
-      }
     end
-    
-    def perform_union(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Copy all entities from target to result
-      target_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Copy all entities from tool to result
-      tool_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Clean up temporary copies
-      target_copy.erase!
-      tool_copy.erase!
-      
-      # Outer shell - this will merge overlapping geometry
-      result_group.entities.outer_shell
-    end
-    
-    def perform_difference(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Copy all entities from target to result
-      target_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Create a temporary group for the tool
-      temp_tool_group = model.active_entities.add_group
-      
-      # Copy all entities from tool to temp group
-      tool_entities.each do |entity|
-        entity.copy(temp_tool_group.entities)
-      end
-      
-      # Subtract the tool from the result
-      result_group.entities.subtract(temp_tool_group.entities)
-      
-      # Clean up temporary copies and groups
-      target_copy.erase!
-      tool_copy.erase!
-      temp_tool_group.erase!
-    end
-    
-    def perform_intersection(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Create temporary groups for target and tool
-      temp_target_group = model.active_entities.add_group
-      temp_tool_group = model.active_entities.add_group
-      
-      # Copy all entities from target and tool to temp groups
-      target_entities.each do |entity|
-        entity.copy(temp_target_group.entities)
-      end
-      
-      tool_entities.each do |entity|
-        entity.copy(temp_tool_group.entities)
-      end
-      
-      # Perform the intersection
-      result_group.entities.intersect_with(temp_target_group.entities, temp_tool_group.entities)
-      
-      # Clean up temporary copies and groups
-      target_copy.erase!
-      tool_copy.erase!
-      temp_target_group.erase!
-      temp_tool_group.erase!
-    end
-    
+
     def chamfer_edges(params)
       log "Chamfering edges with params: #{params.inspect}"
       model = Sketchup.active_model

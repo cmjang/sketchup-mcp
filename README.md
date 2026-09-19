@@ -69,13 +69,15 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 * `get_selection` - Get currently selected entities
 * `set_camera` - Position the camera by standard view (`top`/`front`/`iso`/...) or explicit eye/target/up, with fov and perspective control; pair with `export_scene` to capture from the new viewpoint
 * `set_material` - Apply a material/color to a component (named colors or `#RRGGBB`)
-* `boolean_operation` - Solid `union`/`difference`/`intersection` between two groups or component instances, via SketchUp's native solid operations. Operates on copies; `delete_originals` also removes the source entities
+* `boolean_operation` - Solid `union`/`difference`/`intersection` between two groups or component instances, via SketchUp's native solid operations. Operates on copies; `delete_originals` also removes the source entities. Reliable for normal-sized geometry; for very small features in very large models SketchUp's solid ops can misbehave (see the joints below for the robust alternative)
+* `create_mortise_tenon` / `create_finger_joint` / `create_dovetail` - Woodworking joints between two boards, cut with classic face-split + pushpull geometry (deterministic, no Pro solid tools, boards keep their entity IDs). All accept a `unit` parameter (`inch` default, `mm`, `cm`, `m`). Boards should be axis-aligned boxes; features must fit within the board face
 * `export_scene` - Export the scene to `skp`, `obj`, `dae`, `stl`, `png` or `jpg`. Image exports accept `width`/`height` and the response reports the `path` of the exported file (in the system temp directory), so it can be read directly by the client
 * `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations (saving, layers, scenes, import, follow-me, shadows, ... — see the tool description for recipes). Each evaluation runs inside an undoable operation; if the code raises, the changes are rolled back
 
 #### Known limitations
 
-The joint tools (`create_mortise_tenon`, `create_dovetail`, `create_finger_joint`) and the Ruby-side `chamfer_edges`/`fillet_edges` handlers predate the current bridge and call long-removed APIs (`Entity#copy`, `Entities#subtract`); they fail with a clean error until rewritten.
+* `chamfer_edges`/`fillet_edges` were removed: their handlers predated the current bridge and called long-removed APIs (`Entity#copy`), so they never worked. SketchUp has no native edge-rounding API; use `eval_ruby` or an extension like RoundCorner for that
+* Right after editing a board, SketchUp may report a sentinel volume (-1) for it until the next full rebuild; `get_model_info` omits volume in that case
 
 ### Example Commands
 

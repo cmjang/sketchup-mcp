@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.19"
+__version__ = "0.1.20"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -519,9 +519,13 @@ def create_mortise_tenon(
     depth: float = 1.0,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a mortise and tenon joint between two components"""
+    """Create a mortise and tenon joint between two boards. The mortise board
+    gets a rectangular hole, the tenon board a matching projection, on the
+    faces nearest each other. unit: inch (default), mm, cm, m. Boards must be
+    solids; each is replaced by the jointed result (new entity ids returned)."""
     try:
         logger.info(f"create_mortise_tenon called with mortise_id={mortise_id}, tenon_id={tenon_id}, width={width}, height={height}, depth={depth}, offsets=({offset_x}, {offset_y}, {offset_z})")
         
@@ -539,7 +543,8 @@ def create_mortise_tenon(
                     "depth": depth,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id
@@ -563,9 +568,12 @@ def create_dovetail(
     num_tails: int = 3,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a dovetail joint between two components"""
+    """Create a dovetail joint between two boards: trapezoidal tails added to
+    the tail board, matching sockets cut from the pin board. angle in degrees.
+    unit: inch (default), mm, cm, m. Boards are replaced by jointed results."""
     try:
         logger.info(f"create_dovetail called with tail_id={tail_id}, pin_id={pin_id}, width={width}, height={height}, depth={depth}, angle={angle}, num_tails={num_tails}")
         
@@ -585,7 +593,8 @@ def create_dovetail(
                     "num_tails": num_tails,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id
@@ -608,9 +617,12 @@ def create_finger_joint(
     num_fingers: int = 5,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a finger joint (box joint) between two components"""
+    """Create a finger joint (box joint): fingers added across board1's near
+    face, matching slots cut into board2, so the boards interlock. unit: inch
+    (default), mm, cm, m. Boards are replaced by jointed results."""
     try:
         logger.info(f"create_finger_joint called with board1_id={board1_id}, board2_id={board2_id}, width={width}, height={height}, depth={depth}, num_fingers={num_fingers}")
         
@@ -629,7 +641,8 @@ def create_finger_joint(
                     "num_fingers": num_fingers,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id

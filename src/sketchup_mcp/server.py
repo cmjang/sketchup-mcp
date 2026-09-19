@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -1010,6 +1010,155 @@ def import_file(ctx: Context, filepath: str) -> str:
         return json.dumps(result)
     except Exception as e:
         return f"Error importing file: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# Docs lookup, selection control, undo/redo, and optional safe mode
+# ---------------------------------------------------------------------------
+
+DOC_BASE = "https://ruby.sketchup.com/"
+
+def _lookup_ruby_api(class_name: str, method: str = None) -> str:
+    """Fetch the official YARD docs page for a class and extract either the
+    method list or one method's signature and description."""
+    import html as html_module
+    name = class_name.strip().replace(".", "::")
+    parts = name.split("::") if "::" in name else [name]
+    if len(parts) == 1 and parts[0] not in ("Sketchup", "Geom", "UI", "Layout"):
+        parts = ["Sketchup", parts[0]]
+    candidates = ["/".join(parts)]
+    if parts[0] != "Sketchup" and len(parts) == 2:
+        candidates.append(parts[-1])
+
+    page = None
+    for c in candidates:
+        try:
+            page = _http_get_bytes(DOC_BASE + c + ".html").decode("utf-8", "replace")
+            break
+        except Exception:
+            continue
+    if page is None:
+        return (f"Class page not found for '{class_name}'. Browse "
+                f"https://ruby.sketchup.com/_index.html for the full list.")
+
+    def strip_tags(fragment: str) -> str:
+        text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", fragment, flags=re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return re.sub(r"\s+", " ", html_module.unescape(text)).strip()
+
+    if method:
+        for suffix in ("instance_method", "class_method"):
+            marker = f'id="{method}-{suffix}"'
+            i = page.find(marker)
+            if i == -1:
+                continue
+            # The detail block runs until the next method anchor or the footer.
+            rest = page[i:]
+            rest = rest[rest.find(">") + 1:]
+            nxt = len(rest)
+            for end_marker in ('id="footer"',):
+                j = rest.find(end_marker, 200)
+                if j != -1:
+                    nxt = min(nxt, j)
+            m = re.search(r'id="[\w?!=<>+-]+-(?:instance|class)_method"', rest[200:])
+            if m:
+                nxt = min(nxt, 200 + m.start())
+            return f"{name}#{method}:\n" + strip_tags(rest[:nxt])[:2000]
+        return (f"Method '{method}' not found on {name}. Available methods are "
+                f"listed below.\n" + _lookup_ruby_api(class_name))
+
+    methods = re.findall(r'id="([\w?!=<>+-]+)-(?:instance|class)_method"', page)
+    unique = sorted(set(methods), key=lambda s: s.lower())
+    # Class docstring from the description block, if present.
+    desc = ""
+    m = re.search(r'<div id="description">(.*?)</div>\s*</div>', page, re.S)
+    if m:
+        desc = strip_tags(m.group(1))[:300]
+    listing = ", ".join(unique[:120])
+    out = f"{name} ({len(unique)} methods)"
+    if desc:
+        out += f"\n{desc}"
+    out += f"\nMethods: {listing}"
+    return out[:4000]
+
+# Safe mode: when SKETCHUP_MCP_SAFE_MODE=1, eval_ruby scripts are screened
+# against a blocklist before execution so an agent cannot touch the file
+# system, spawn processes, open sockets or quit SketchUp. Guardrail, not a
+# sandbox - a determined script could still evade string matching.
+_RUBY_BLOCKLIST = [
+    (re.compile(r"\bsystem\s*\(|\bexec\s*\(|\bspawn\s*\("), "OS command execution"),
+    (re.compile(r"%x[\[{(]|`[^`]*`"), "shell execution (%x/backticks)"),
+    (re.compile(r"\bIO\.popen|\bpopen\s*\("), "process spawn"),
+    (re.compile(r"\beval\s*\(|instance_eval|class_eval|module_eval"), "dynamic evaluation"),
+    (re.compile(r"\bFile\s*\.|\bFileUtils\b|\bTempfile\b|\bPathname\b"), "file I/O"),
+    (re.compile(r"\bDir\s*\.|\bDir\s*\["), "filesystem access"),
+    (re.compile(r"(?<![\w.])load\s+(?=['\"])|(?<![\w.])require\s+(?=['\"])"), "loading ruby files"),
+    (re.compile(r"\bNet::|\bTCPSocket\b|\bTCPServer\b|\bUDPSocket\b|open-uri|URI\.open"), "network access"),
+    (re.compile(r"Sketchup\.(open_file|quit|send_action|install_from_archive|load)\b"), "SketchUp system actions"),
+]
+
+def _safe_mode_check(code: str):
+    if os.environ.get("SKETCHUP_MCP_SAFE_MODE") != "1":
+        return None
+    for pattern, reason in _RUBY_BLOCKLIST:
+        m = pattern.search(code)
+        if m:
+            return (f"Safe mode (SKETCHUP_MCP_SAFE_MODE=1) blocked this script: {reason} "
+                    f"(matched {m.group(0)!r}). Rewrite the code without it.")
+    return None
+
+@mcp.tool()
+def lookup_ruby_api(ctx: Context, class_name: str, method: str = None) -> str:
+    """Look up the official SketchUp Ruby API documentation (ruby.sketchup.com).
+    class_name like 'Face', 'Entities', 'Model', 'Geom::Point3d', 'UI'. Without
+    method: lists the class's methods. With method (e.g. 'pushpull'): returns
+    its signature and description."""
+    try:
+        return _lookup_ruby_api(class_name, method)
+    except Exception as e:
+        return f"Error looking up API docs: {str(e)}"
+
+@mcp.tool()
+def set_selection(ctx: Context, ids: List[str] = None, mode: str = "replace") -> str:
+    """Control the selection. mode: 'replace' (default) selects exactly the
+    given entity ids, 'add' extends, 'remove' deselects them, 'clear' empties
+    the selection (ids not needed)."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {"mode": mode}
+        if ids:
+            arguments["ids"] = ids
+        result = sketchup.send_command(
+            method="tools/call",
+            params={"name": "set_selection", "arguments": arguments},
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error setting selection: {str(e)}"
+
+@mcp.tool()
+def undo(ctx: Context) -> str:
+    """Undo the last operation in SketchUp."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call", params={"name": "undo", "arguments": {}},
+            request_id=ctx.request_id)
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error undoing: {str(e)}"
+
+@mcp.tool()
+def redo(ctx: Context) -> str:
+    """Redo the last undone operation in SketchUp."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call", params={"name": "redo", "arguments": {}},
+            request_id=ctx.request_id)
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error redoing: {str(e)}"
 
 def main():
     mcp.run()

@@ -268,6 +268,12 @@ module SU_MCP
           set_texture(args)
         when "import_file"
           import_file(args)
+        when "set_selection"
+          set_selection(args)
+        when "undo"
+          undo_action(args)
+        when "redo"
+          redo_action(args)
         when "export", "export_scene"
           export_scene(args)
         when "set_material"
@@ -696,6 +702,41 @@ module SU_MCP
       }
     end
     
+    # Selection control: replace (default), add, remove entities by id,
+    # or clear the selection entirely.
+    def set_selection(params)
+      model = Sketchup.active_model
+      mode = params["mode"] || "replace"
+      ids = (params["ids"] || []).map { |i| i.to_s.gsub('"', '').to_i }
+
+      case mode
+      when "clear"
+        model.selection.clear
+      when "add", "replace"
+        entities = ids.map { |i| model.find_entity_by_id(i) }.compact
+        raise "No valid entities found for ids #{params['ids'].inspect}" if ids.any? && entities.empty?
+        model.selection.clear if mode == "replace"
+        model.selection.add(entities) unless entities.empty?
+      when "remove"
+        entities = ids.map { |i| model.find_entity_by_id(i) }.compact
+        model.selection.remove(entities) unless entities.empty?
+      else
+        raise "Unknown mode '#{mode}' (use replace, add, remove or clear)"
+      end
+
+      { success: true, selected_count: model.selection.size }
+    end
+
+    def undo_action(params)
+      Sketchup.undo
+      { success: true, result: "undo" }
+    end
+
+    def redo_action(params)
+      Sketchup.redo
+      { success: true, result: "redo" }
+    end
+
     # Lightweight health check for the bridge: versions and model state
     # without touching geometry.
     def get_addon_status(params)

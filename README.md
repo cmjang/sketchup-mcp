@@ -67,11 +67,13 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 * `delete_component` - Remove a component from the scene by entity ID
 * `transform_component` - Move, rotate, or scale a component
 * `get_selection` - Get currently selected entities
+* `get_addon_status` - Lightweight health check: SketchUp version/platform/Pro status, current model, bridge port and uptime. Verify the extension is reachable before anything else
+* `get_viewport_screenshot` - Capture the current 3D viewport and return it as an **image** the agent can see directly (no file reading) — pair with `set_camera` to inspect from specific viewpoints
 * `set_camera` - Position the camera by standard view (`top`/`front`/`iso`/...) or explicit eye/target/up, with fov and perspective control; pair with `export_scene` to capture from the new viewpoint
 * `set_material` - Apply a material/color to a component (named colors or `#RRGGBB`)
 * `boolean_operation` - Solid `union`/`difference`/`intersection` between two groups or component instances, via SketchUp's native solid operations. Operates on copies; `delete_originals` also removes the source entities. Reliable for normal-sized geometry; for very small features in very large models SketchUp's solid ops can misbehave (see the joints below for the robust alternative)
 * `create_mortise_tenon` / `create_finger_joint` / `create_dovetail` - Woodworking joints between two boards, cut with classic face-split + pushpull geometry (deterministic, no Pro solid tools, boards keep their entity IDs). All accept a `unit` parameter (`inch` default, `mm`, `cm`, `m`). Boards should be axis-aligned boxes; features must fit within the board face
-* `export_scene` - Export the scene to `skp`, `obj`, `dae`, `stl`, `png` or `jpg`. Image exports accept `width`/`height` and the response reports the `path` of the exported file (in the system temp directory), so it can be read directly by the client
+* `export_scene` - Export the scene to `skp`, `obj`, `dae`, `stl`, `png` or `jpg`. `filepath` sets an absolute destination (parent folders created); without it a timestamped file goes to the system temp directory and the response reports its `path`. Image exports accept `width`/`height`. `skp` exports use `save_copy` so the working model's path stays bound where it was (models never saved before fall back to `save`)
 * `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations (saving, layers, scenes, import, follow-me, shadows, ... — see the tool description for recipes). Each evaluation runs inside an undoable operation; if the code raises, the changes are rolled back
 
 #### Known limitations

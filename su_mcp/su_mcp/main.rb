@@ -38,6 +38,7 @@ module SU_MCP
 
     def start
       return if @running
+      @start_time = Time.now
       
       begin
         log "Starting server on localhost:#{@port}..."
@@ -259,6 +260,10 @@ module SU_MCP
           get_model_info(args)
         when "set_camera"
           set_camera(args)
+        when "get_viewport_screenshot"
+          get_viewport_screenshot(args)
+        when "get_addon_status"
+          get_addon_status(args)
         when "export", "export_scene"
           export_scene(args)
         when "set_material"
@@ -687,6 +692,43 @@ module SU_MCP
       }
     end
     
+    # Lightweight health check for the bridge: versions and model state
+    # without touching geometry.
+    def get_addon_status(params)
+      model = Sketchup.active_model
+      status = {
+        sketchup_version: Sketchup.version.to_s,
+        platform: Sketchup.platform.to_s,
+        pro: Sketchup.is_pro?,
+        model_title: model.title,
+        model_path: model.path,
+        entities: model.entities.count,
+        server_port: @port,
+        ruby_version: RUBY_VERSION,
+        uptime_seconds: @start_time ? (Time.now - @start_time).round : nil
+      }
+      { success: true, result: JSON.generate(status) }
+    end
+
+    # Write a PNG of the current viewport to a caller-provided path. The
+    # Python side passes a temp file, reads the bytes back and returns them
+    # as an MCP image block, so the agent sees the viewport directly.
+    def get_viewport_screenshot(params)
+      model = Sketchup.active_model
+      filepath = params["filepath"].to_s
+      raise "filepath required" if filepath.empty?
+
+      view = model.active_view
+      ok = view.write_image(
+        filename: filepath,
+        width: (params["width"] || 1600).to_i,
+        height: (params["height"] || 900).to_i,
+        antialias: true
+      )
+      raise "write_image failed" unless ok
+      { success: true, path: filepath }
+    end
+
     def export_scene(params)
       log "Exporting scene with params: #{params.inspect}"
       model = Sketchup.active_model
@@ -701,17 +743,31 @@ module SU_MCP
         # Generate a unique filename
         timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
         filename = "sketchup_export_#{timestamp}"
+
+        # Caller-provided destination wins over the temp dir.
+        custom_path = params["filepath"].to_s
+        unless custom_path.empty?
+          dir = File.dirname(custom_path)
+          FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
+        end
         
         case format.downcase
         when "skp"
           # Export as SketchUp file
-          export_path = File.join(temp_dir, "#{filename}.skp")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.skp") : custom_path
           log "Exporting to SketchUp file: #{export_path}"
-          model.save(export_path)
+          begin
+            # save_copy keeps the working model's own path binding intact;
+            # it requires the model to have been saved once, so unsaved
+            # models fall back to save (which binds the export path).
+            model.save_copy(export_path)
+          rescue ArgumentError
+            model.save(export_path)
+          end
           
         when "obj"
           # Export as OBJ file
-          export_path = File.join(temp_dir, "#{filename}.obj")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.obj") : custom_path
           log "Exporting to OBJ file: #{export_path}"
           
           # Check if OBJ exporter is available
@@ -729,7 +785,7 @@ module SU_MCP
           
         when "dae"
           # Export as COLLADA file
-          export_path = File.join(temp_dir, "#{filename}.dae")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.dae") : custom_path
           log "Exporting to COLLADA file: #{export_path}"
           
           # Check if COLLADA exporter is available
@@ -742,7 +798,7 @@ module SU_MCP
           
         when "stl"
           # Export as STL file
-          export_path = File.join(temp_dir, "#{filename}.stl")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.stl") : custom_path
           log "Exporting to STL file: #{export_path}"
           
           # Check if STL exporter is available
@@ -756,7 +812,7 @@ module SU_MCP
         when "png", "jpg", "jpeg"
           # Export as image
           ext = format.downcase == "jpg" ? "jpeg" : format.downcase
-          export_path = File.join(temp_dir, "#{filename}.#{ext}")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.#{ext}") : custom_path
           log "Exporting to image file: #{export_path}"
           
           # Get the current view

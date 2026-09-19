@@ -1,8 +1,10 @@
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
 import json
 import asyncio
 import logging
+import os
+import tempfile
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
@@ -13,7 +15,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.20"
+__version__ = "0.1.21"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -58,7 +60,7 @@ class SketchupConnection:
     def receive_full_response(self, sock, buffer_size=8192):
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        sock.settimeout(15.0)
+        sock.settimeout(120.0)
         
         try:
             while True:
@@ -149,7 +151,7 @@ class SketchupConnection:
                 self.sock.sendall(request_bytes)
                 logger.info(f"Request sent, waiting for response...")
                 
-                self.sock.settimeout(15.0)
+                self.sock.settimeout(120.0)
                 
                 response_data = self.receive_full_response(self.sock)
                 logger.info(f"Received {len(response_data)} bytes of data")
@@ -479,23 +481,29 @@ def set_material(
 def export_scene(
     ctx: Context,
     format: str = "skp",
+    filepath: str = None,
     width: int = 1920,
     height: int = 1080
 ) -> str:
-    """Export the current scene (skp/obj/dae/stl/png/jpg). For image formats
-    width/height set the viewport export size; the returned path points at the
-    exported file in the system temp directory."""
+    """Export the current scene (skp/obj/dae/stl/png/jpg). filepath: absolute
+    destination path (parent folders are created); omit for a timestamped
+    file in the system temp directory. For image formats width/height set the
+    viewport export size. skp exports use save_copy, so the working model's
+    own path is never rebound."""
     try:
         sketchup = get_sketchup_connection()
+        arguments = {
+            "format": format,
+            "width": width,
+            "height": height
+        }
+        if filepath:
+            arguments["filepath"] = filepath
         result = sketchup.send_command(
             method="tools/call",
             params={
                 "name": "export",
-                "arguments": {
-                    "format": format,
-                    "width": width,
-                    "height": height
-                }
+                "arguments": arguments
             },
             request_id=ctx.request_id
         )
@@ -508,6 +516,64 @@ def export_scene(
         return json.dumps(response)
     except Exception as e:
         return f"Error exporting scene: {str(e)}"
+
+@mcp.tool()
+def get_viewport_screenshot(
+    ctx: Context,
+    width: int = 1600,
+    height: int = 900
+) -> Image:
+    """Capture the current SketchUp 3D viewport and return it as an image,
+    so you can see the model directly without reading files. Pair with
+    set_camera to inspect from specific viewpoints."""
+    temp_path = os.path.join(tempfile.gettempdir(), f"sketchup_screenshot_{os.getpid()}.png")
+    try:
+        sketchup = get_sketchup_connection()
+        sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "get_viewport_screenshot",
+                "arguments": {
+                    "filepath": temp_path,
+                    "width": width,
+                    "height": height
+                }
+            },
+            request_id=ctx.request_id
+        )
+        if not os.path.exists(temp_path):
+            raise Exception("Screenshot file was not created")
+        with open(temp_path, "rb") as f:
+            image_bytes = f.read()
+        return Image(data=image_bytes, format="png")
+    except Exception as e:
+        logger.error(f"Error capturing screenshot: {str(e)}")
+        raise Exception(f"Screenshot failed: {str(e)}")
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+@mcp.tool()
+def get_addon_status(ctx: Context) -> str:
+    """Lightweight health check: SketchUp version, platform, Pro status,
+    current model title/path and entity count, bridge port and uptime.
+    Use this to verify the SketchUp extension is reachable before doing
+    anything else."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "get_addon_status",
+                "arguments": {}
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error getting addon status: {str(e)}"
 
 @mcp.tool()
 def create_mortise_tenon(
